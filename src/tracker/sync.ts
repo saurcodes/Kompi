@@ -6,12 +6,39 @@ export interface SyncBackend {
   pull(): Promise<TokenRecord[]>;
 }
 
+// ─── Runtime record validation ────────────────────────────────────────────────
+
+function isValidRecord(r: unknown): r is TokenRecord {
+  if (typeof r !== "object" || r === null) return false;
+  const rec = r as Record<string, unknown>;
+  return (
+    typeof rec.id === "string" && rec.id.length > 0 &&
+    typeof rec.device_id === "string" &&
+    typeof rec.device_label === "string" &&
+    typeof rec.session_id === "string" &&
+    typeof rec.timestamp === "string" &&
+    typeof rec.model === "string" &&
+    typeof rec.input_tokens === "number" &&
+    typeof rec.output_tokens === "number" &&
+    typeof rec.cache_read_tokens === "number" &&
+    typeof rec.cache_write_tokens === "number" &&
+    typeof rec.cost_usd === "number" &&
+    typeof rec.project === "string" &&
+    (rec.event_type === "post-tool" || rec.event_type === "stop")
+  );
+}
+
+function parseRecords(raw: unknown): TokenRecord[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isValidRecord);
+}
+
 // ─── S3 / Cloudflare R2 (S3-compatible) ──────────────────────────────────────
 
 export function createS3Backend(config: {
   bucket: string;
   region: string;
-  endpoint?: string;      // set for R2: https://<account>.r2.cloudflarestorage.com
+  endpoint?: string;
   accessKeyId: string;
   secretAccessKey: string;
   deviceId: string;
@@ -19,7 +46,7 @@ export function createS3Backend(config: {
   const key = `devices/${config.deviceId}/records.json`;
 
   async function getS3Client() {
-    const { S3Client, PutObjectCommand, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const { S3Client } = await import("@aws-sdk/client-s3");
     return new S3Client({
       region: config.region,
       endpoint: config.endpoint,
@@ -52,9 +79,10 @@ export function createS3Backend(config: {
           new GetObjectCommand({ Bucket: config.bucket, Key: key })
         );
         const body = await res.Body?.transformToString();
-        return body ? (JSON.parse(body) as TokenRecord[]) : [];
+        if (!body) return [];
+        return parseRecords(JSON.parse(body));
       } catch (e: unknown) {
-        if ((e as { name?: string }).name === "NoSuchKey") return [];
+        if (e instanceof Error && e.name === "NoSuchKey") return [];
         throw e;
       }
     },
@@ -68,13 +96,18 @@ export function createFirestoreBackend(config: {
   apiKey: string;
   deviceId: string;
 }): SyncBackend {
-  const baseUrl = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/(default)/documents`;
-  const collectionPath = `devices/${config.deviceId}/records`;
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(config.projectId)}/databases/(default)/documents`;
+  const collectionPath = `devices/${encodeURIComponent(config.deviceId)}/records`;
+  // API key goes in Authorization header, not URL
+  const authHeaders = {
+    "Content-Type": "application/json",
+    "x-goog-api-key": config.apiKey,
+  };
 
   return {
     async push(records) {
       for (const record of records) {
-        const url = `${baseUrl}/${collectionPath}/${record.id}?key=${config.apiKey}`;
+        const url = `${baseUrl}/${collectionPath}/${encodeURIComponent(record.id)}`;
         const fields = Object.fromEntries(
           Object.entries(record).map(([k, v]) => [
             k,
@@ -83,24 +116,28 @@ export function createFirestoreBackend(config: {
               : { stringValue: String(v ?? "") },
           ])
         );
-        await fetch(url, {
+        const res = await fetch(url, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders,
           body: JSON.stringify({ fields }),
         });
+        if (!res.ok) throw new Error(`Firestore push failed for ${record.id}: ${res.status}`);
       }
     },
     async pull() {
-      const url = `${baseUrl}/${collectionPath}?key=${config.apiKey}`;
-      const res = await fetch(url);
+      const url = `${baseUrl}/${collectionPath}`;
+      const res = await fetch(url, { headers: authHeaders });
       if (!res.ok) return [];
-      const data = (await res.json()) as { documents?: Array<{ fields: Record<string, { stringValue?: string; doubleValue?: number }> }> };
-      return (data.documents ?? []).map((doc) => {
+      const data = (await res.json()) as {
+        documents?: Array<{ fields: Record<string, { stringValue?: string; doubleValue?: number }> }>
+      };
+      const raw = (data.documents ?? []).map((doc) => {
         const f = doc.fields;
         return Object.fromEntries(
           Object.entries(f).map(([k, v]) => [k, v.doubleValue ?? v.stringValue ?? ""])
-        ) as unknown as TokenRecord;
+        );
       });
+      return parseRecords(raw);
     },
   };
 }
@@ -130,7 +167,7 @@ export async function syncFromRemote(backend: SyncBackend): Promise<{ pulled: nu
 // ─── Cloudflare D1 via Worker API ────────────────────────────────────────────
 
 export function createD1Backend(config: {
-  workerUrl: string;  // e.g. https://kompi.<sub>.workers.dev
+  workerUrl: string;
   apiKey: string;
   deviceId: string;
 }): SyncBackend {
@@ -150,13 +187,27 @@ export function createD1Backend(config: {
     },
     async pull() {
       const res = await fetch(
-        `${config.workerUrl}/records?device_id=${config.deviceId}&limit=500`,
+        `${config.workerUrl}/records?device_id=${encodeURIComponent(config.deviceId)}&limit=500`,
         { headers }
       );
       if (!res.ok) throw new Error(`D1 pull failed: ${res.status}`);
-      return (await res.json()) as TokenRecord[];
+      return parseRecords(await res.json());
     },
   };
+}
+
+// ─── Backend factory ──────────────────────────────────────────────────────────
+
+function assertHttps(url: string, varName: string): void {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") {
+      throw new Error(`${varName} must use HTTPS (got: ${parsed.protocol})`);
+    }
+  } catch (e) {
+    if (e instanceof TypeError) throw new Error(`${varName} is not a valid URL`);
+    throw e;
+  }
 }
 
 export function backendFromEnv(deviceId: string): SyncBackend | null {
@@ -170,8 +221,8 @@ export function backendFromEnv(deviceId: string): SyncBackend | null {
   const firebaseProject = process.env.KOMPI_FIREBASE_PROJECT;
   const firebaseKey = process.env.KOMPI_FIREBASE_KEY;
 
-  // Cloudflare D1 takes priority when configured
   if (d1Url && d1Key) {
+    assertHttps(d1Url, "KOMPI_D1_URL");
     return createD1Backend({ workerUrl: d1Url, apiKey: d1Key, deviceId });
   }
 
@@ -180,6 +231,7 @@ export function backendFromEnv(deviceId: string): SyncBackend | null {
   }
 
   if (syncBucket && syncKey && syncSecret) {
+    if (syncUrl) assertHttps(syncUrl, "KOMPI_SYNC_URL");
     return createS3Backend({
       bucket: syncBucket,
       region: syncRegion,

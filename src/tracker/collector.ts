@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { hostname, platform } from "os";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 import { insertRecord, makeDeviceId } from "./store.js";
 import { computeCost } from "./models.js";
 import type { TokenRecord } from "./models.js";
@@ -27,14 +27,15 @@ function deviceLabel(): string {
 
 function currentProject(): string {
   try {
-    const remote = execSync("git remote get-url origin 2>/dev/null", {
+    const result = spawnSync("git", ["remote", "get-url", "origin"], {
       encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    return remote || process.cwd();
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (result.status === 0 && result.stdout) return result.stdout.trim();
   } catch {
-    return process.cwd();
+    // ignore
   }
+  return process.cwd();
 }
 
 export function recordFromHook(payload: HookPayload): void {
@@ -65,14 +66,19 @@ export function recordFromHook(payload: HookPayload): void {
   insertRecord(record);
 }
 
+function safeInt(val: string | undefined): number {
+  const n = parseInt(val ?? "0", 10);
+  return isNaN(n) ? 0 : n;
+}
+
 export function parseHookEnv(): HookPayload {
   return {
     session_id: process.env.CLAUDE_SESSION_ID,
     model: process.env.CLAUDE_MODEL,
-    input_tokens: parseInt(process.env.CLAUDE_INPUT_TOKENS ?? "0") || 0,
-    output_tokens: parseInt(process.env.CLAUDE_OUTPUT_TOKENS ?? "0") || 0,
-    cache_read_input_tokens: parseInt(process.env.CLAUDE_CACHE_READ_TOKENS ?? "0") || 0,
-    cache_creation_input_tokens: parseInt(process.env.CLAUDE_CACHE_WRITE_TOKENS ?? "0") || 0,
+    input_tokens: safeInt(process.env.CLAUDE_INPUT_TOKENS),
+    output_tokens: safeInt(process.env.CLAUDE_OUTPUT_TOKENS),
+    cache_read_input_tokens: safeInt(process.env.CLAUDE_CACHE_READ_TOKENS),
+    cache_creation_input_tokens: safeInt(process.env.CLAUDE_CACHE_WRITE_TOKENS),
     tool_name: process.env.CLAUDE_TOOL_NAME,
   };
 }

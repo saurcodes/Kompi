@@ -9,6 +9,10 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
+const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_RECORDS_PER_PUSH = 10_000;
+const MAX_LIMIT = 1_000;
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -20,9 +24,73 @@ function unauthorized(): Response {
   return json({ error: "Unauthorized" }, 401);
 }
 
+function badRequest(msg: string): Response {
+  return json({ error: msg }, 400);
+}
+
 function authorized(req: Request, env: Env): boolean {
   const auth = req.headers.get("Authorization") ?? "";
   return auth === `Bearer ${env.KOMPI_API_KEY}`;
+}
+
+// ─── Runtime record validation ────────────────────────────────────────────────
+
+interface ValidRecord {
+  id: string;
+  device_id: string;
+  device_label: string;
+  session_id: string;
+  timestamp: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+  project: string;
+  tool_name: string | null;
+  event_type: string;
+}
+
+function validateRecord(r: unknown): ValidRecord | null {
+  if (typeof r !== "object" || r === null) return null;
+  const rec = r as Record<string, unknown>;
+
+  const id = typeof rec.id === "string" && rec.id.length > 0 ? rec.id : null;
+  const device_id = typeof rec.device_id === "string" ? rec.device_id : null;
+  const device_label = typeof rec.device_label === "string" ? rec.device_label : null;
+  const session_id = typeof rec.session_id === "string" ? rec.session_id : null;
+  const timestamp = typeof rec.timestamp === "string" ? rec.timestamp : null;
+  const model = typeof rec.model === "string" ? rec.model : null;
+  const input_tokens = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
+  const output_tokens = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
+  const cache_read_tokens = typeof rec.cache_read_tokens === "number" ? rec.cache_read_tokens : null;
+  const cache_write_tokens = typeof rec.cache_write_tokens === "number" ? rec.cache_write_tokens : null;
+  const cost_usd = typeof rec.cost_usd === "number" ? rec.cost_usd : null;
+  const project = typeof rec.project === "string" ? rec.project : null;
+
+  if (!id || !device_id || !device_label || !session_id || !timestamp || !model ||
+      input_tokens === null || output_tokens === null || cache_read_tokens === null ||
+      cache_write_tokens === null || cost_usd === null || project === null) {
+    return null;
+  }
+
+  return {
+    id,
+    device_id,
+    device_label,
+    session_id,
+    timestamp,
+    model,
+    input_tokens,
+    output_tokens,
+    cache_read_tokens,
+    cache_write_tokens,
+    cost_usd,
+    project,
+    tool_name: typeof rec.tool_name === "string" ? rec.tool_name : null,
+    event_type: typeof rec.event_type === "string" ? rec.event_type : "stop",
+  };
 }
 
 async function migrate(db: D1Database): Promise<void> {
@@ -57,7 +125,6 @@ export default {
       return new Response(null, { headers: CORS });
     }
 
-    // Public health check
     if (url.pathname === "/health") {
       return json({ ok: true });
     }
@@ -66,8 +133,26 @@ export default {
 
     // POST /records — bulk upsert records from a device
     if (req.method === "POST" && url.pathname === "/records") {
+      const contentLength = parseInt(req.headers.get("content-length") ?? "0", 10);
+      if (contentLength > MAX_PAYLOAD_BYTES) {
+        return badRequest(`Payload too large (max ${MAX_PAYLOAD_BYTES / 1024 / 1024} MB)`);
+      }
+
       await migrate(env.DB);
-      const records = (await req.json()) as Record<string, unknown>[];
+      const body = await req.json() as unknown;
+      if (!Array.isArray(body)) return badRequest("Request body must be a JSON array");
+      if (body.length > MAX_RECORDS_PER_PUSH) {
+        return badRequest(`Too many records (max ${MAX_RECORDS_PER_PUSH} per push)`);
+      }
+
+      const valid: ValidRecord[] = [];
+      for (const item of body) {
+        const rec = validateRecord(item);
+        if (rec) valid.push(rec);
+      }
+
+      if (valid.length === 0) return json({ inserted: 0, skipped: body.length });
+
       const stmt = env.DB.prepare(`
         INSERT OR REPLACE INTO token_records
           (id, device_id, device_label, session_id, timestamp, model,
@@ -75,22 +160,24 @@ export default {
            cost_usd, project, tool_name, event_type)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
-      const batch = records.map((r) =>
+      const batch = valid.map((r) =>
         stmt.bind(
           r.id, r.device_id, r.device_label, r.session_id, r.timestamp, r.model,
           r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_write_tokens,
-          r.cost_usd, r.project, r.tool_name ?? null, r.event_type
+          r.cost_usd, r.project, r.tool_name, r.event_type
         )
       );
       await env.DB.batch(batch);
-      return json({ inserted: records.length });
+      return json({ inserted: valid.length, skipped: body.length - valid.length });
     }
 
     // GET /records?device_id=xxx&limit=50
     if (req.method === "GET" && url.pathname === "/records") {
       await migrate(env.DB);
       const deviceId = url.searchParams.get("device_id");
-      const limit = parseInt(url.searchParams.get("limit") ?? "100");
+      const rawLimit = parseInt(url.searchParams.get("limit") ?? "100", 10);
+      const limit = isNaN(rawLimit) || rawLimit < 1 ? 100 : Math.min(rawLimit, MAX_LIMIT);
+
       const result = deviceId
         ? await env.DB.prepare(
             "SELECT * FROM token_records WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?"
@@ -124,11 +211,11 @@ export default {
       return json(result.results);
     }
 
-    // GET /report?device_id=xxx — advisor tips (basic pattern matching in Worker)
+    // GET /report?device_id=xxx — advisor tips
     if (req.method === "GET" && url.pathname === "/report") {
       await migrate(env.DB);
       const deviceId = url.searchParams.get("device_id");
-      if (!deviceId) return json({ error: "device_id required" }, 400);
+      if (!deviceId) return badRequest("device_id required");
 
       const records = (
         await env.DB.prepare(
@@ -138,16 +225,16 @@ export default {
 
       const tips: string[] = [];
 
-      const avgInput = records.reduce((s, r) => s + (r.input_tokens as number), 0) / (records.length || 1);
-      const cacheTotal = records.reduce((s, r) => s + (r.cache_read_tokens as number), 0);
-      const inputTotal = records.reduce((s, r) => s + (r.input_tokens as number), 0);
+      const avgInput = records.reduce((s, r) => s + (Number(r.input_tokens) || 0), 0) / (records.length || 1);
+      const cacheTotal = records.reduce((s, r) => s + (Number(r.cache_read_tokens) || 0), 0);
+      const inputTotal = records.reduce((s, r) => s + (Number(r.input_tokens) || 0), 0);
       if (avgInput > 2000 && cacheTotal / (inputTotal || 1) < 0.1) {
         tips.push("enable_prompt_caching");
       }
 
       const opusRecords = records.filter((r) => String(r.model).includes("opus"));
       if (opusRecords.length >= 3) {
-        const avgOut = opusRecords.reduce((s, r) => s + (r.output_tokens as number), 0) / opusRecords.length;
+        const avgOut = opusRecords.reduce((s, r) => s + (Number(r.output_tokens) || 0), 0) / opusRecords.length;
         if (avgOut < 500) tips.push("use_sonnet_for_complex");
       }
 

@@ -58,6 +58,13 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   },
 };
 
+const FALLBACK_PRICING: ModelPricing = {
+  input_per_mtok: 3.0,
+  output_per_mtok: 15.0,
+  cache_read_per_mtok: 0.3,
+  cache_write_per_mtok: 3.75,
+};
+
 export function computeCost(
   model: string,
   inputTokens: number,
@@ -65,7 +72,7 @@ export function computeCost(
   cacheReadTokens: number,
   cacheWriteTokens: number
 ): number {
-  const pricing = MODEL_PRICING[model] ?? MODEL_PRICING["claude-sonnet-4-6"];
+  const pricing = MODEL_PRICING[model] ?? MODEL_PRICING["claude-sonnet-4-6"] ?? FALLBACK_PRICING;
   return (
     (inputTokens * pricing.input_per_mtok) / 1_000_000 +
     (outputTokens * pricing.output_per_mtok) / 1_000_000 +

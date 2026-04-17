@@ -59,31 +59,30 @@ const compressBulletLists: Rule = {
 
 const dropRedundantContext: Rule = {
   name: "drop-redundant-context",
-  description: "Remove repeated file path mentions already established in context",
+  description: "Remove repeated file path backtick references already established in context",
   apply(ctx) {
     const lines = ctx.prompt.split("\n");
     const seenPaths = new Set<string>();
     const result: string[] = [];
-    const pathPattern = /`([^`]+\.[a-z]{1,6})`/g;
+    const pathPattern = /`([^`]+\.[a-zA-Z0-9]{1,10})`/g;
 
     for (const line of lines) {
       let match: RegExpExecArray | null;
-      let skip = false;
+      let modifiedLine = line;
       const localPaths: string[] = [];
+      pathPattern.lastIndex = 0;
 
       while ((match = pathPattern.exec(line)) !== null) {
         if (seenPaths.has(match[1])) {
-          skip = true;
+          // Remove only the redundant backtick reference, not the whole line
+          modifiedLine = modifiedLine.replace(`\`${match[1]}\``, match[1]);
         } else {
           localPaths.push(match[1]);
         }
       }
-      pathPattern.lastIndex = 0;
 
-      if (!skip) {
-        localPaths.forEach((p) => seenPaths.add(p));
-        result.push(line);
-      }
+      localPaths.forEach((p) => seenPaths.add(p));
+      result.push(modifiedLine);
     }
 
     const prompt = result.join("\n");

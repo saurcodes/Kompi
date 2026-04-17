@@ -129,7 +129,19 @@ export function startWebDashboard() {
     res.end("Not found");
   });
 
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Kompi: port ${PORT} is already in use. Set KOMPI_WEB_PORT to use a different port.`);
+    } else {
+      console.error(`Kompi web server error: ${err.message}`);
+    }
+    process.exit(1);
+  });
+
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`Kompi web dashboard: http://localhost:${PORT}`);
   });
+
+  process.on("SIGINT", () => server.close());
+  process.on("SIGTERM", () => server.close());
 }

@@ -22,8 +22,13 @@ program
   .description("Record a token event from a Claude Code hook (internal use)")
   .option("--event <type>", "Event type: post-tool | stop", "stop")
   .action((opts) => {
+    const eventType = opts.event;
+    if (eventType !== "post-tool" && eventType !== "stop") {
+      console.error(`kompi record: invalid --event value "${eventType}". Must be "post-tool" or "stop".`);
+      process.exit(1);
+    }
     const payload = parseHookEnv();
-    payload.event_type = opts.event as "post-tool" | "stop";
+    payload.event_type = eventType;
     recordFromHook(payload);
 
     const backend = backendFromEnv(makeDeviceId(hostname(), platform()));

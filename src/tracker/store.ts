@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash } from "crypto";
 import { homedir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
 import { mkdirSync, existsSync } from "fs";
 import type { TokenRecord, DeviceSummary } from "./models.js";
 
@@ -10,7 +10,7 @@ function dbPath(): string {
 }
 
 function ensureDir(filePath: string) {
-  const dir = filePath.substring(0, filePath.lastIndexOf("/"));
+  const dir = dirname(filePath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
@@ -19,8 +19,16 @@ let _db: Database.Database | null = null;
 function db(): Database.Database {
   if (_db) return _db;
   const path = dbPath();
-  ensureDir(path);
-  _db = new Database(path);
+  try {
+    ensureDir(path);
+  } catch (e) {
+    throw new Error(`Kompi: failed to create DB directory for ${path}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    _db = new Database(path);
+  } catch (e) {
+    throw new Error(`Kompi: failed to open DB at ${path}: ${e instanceof Error ? e.message : String(e)}`);
+  }
   _db.pragma("journal_mode = WAL");
   migrate(_db);
   return _db;
@@ -108,8 +116,8 @@ export function getRecentRecords(deviceId: string, limit = 50): TokenRecord[] {
 export function getSessionCount(deviceId: string): number {
   const row = db().prepare(`
     SELECT COUNT(DISTINCT session_id) AS cnt FROM token_records WHERE device_id = ?
-  `).get(deviceId) as { cnt: number };
-  return row.cnt;
+  `).get(deviceId) as { cnt: number } | undefined;
+  return row?.cnt ?? 0;
 }
 
 export function exportAll(): TokenRecord[] {
