@@ -1,0 +1,16 @@
+name = "kompi"
+main = "worker/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kompi"
+database_id = ""  # Fill in after: wrangler d1 create kompi
+
+[vars]
+# Set secrets via: wrangler secret put KOMPI_API_KEY
+
+[[routes]]
+pattern = "kompi.<your-subdomain>.workers.dev/*"
+zone_name = "<your-subdomain>.workers.dev"
